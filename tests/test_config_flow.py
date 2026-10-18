@@ -5,6 +5,7 @@ from homeassistant.config_entries import SOURCE_RECONFIGURE, SOURCE_USER
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import config_validation as cv
 from homeassistant.util import dt as dt_util
+from probatio import to_field_list
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.gps_timeline.const import (
@@ -21,7 +22,7 @@ from custom_components.gps_timeline.const import (
 
 
 def serialize_schema(schema):
-    return cv.to_field_list(schema, custom_serializer=cv.custom_serializer)
+    return to_field_list(schema, custom_serializer=cv.custom_serializer)
 
 
 TRACKER_ATTRS = {

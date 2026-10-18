@@ -46,3 +46,54 @@ purge:
             - domain: person
             - domain: sensor
             - domain: geo_location
+
+import_google_timeline:
+  name: Import Google Timeline JSON
+  description: >-
+    Reads a Google on-device JSON export (semanticSegments) from the same directory
+    as gps_timeline.db, normally /config/gps_timeline/. Imports timelinePath points,
+    visit locations and activity endpoints into points, and visits/activities into
+    ordinary companion history. No entities are created or updated. Existing rows
+    are preserved. Only one coordinate is kept per tracker/timestamp: timelinePath
+    takes precedence over activity endpoints, then visit locations; the first point
+    wins ties. Parsing runs in the background and the entire file is validated before
+    the archive is changed. Repeating an import adds only missing rows.
+    The optional response reports days with new records (Home Assistant timezone),
+    inserted points/states, skipped points, and source segment/visit/activity counts.
+  fields:
+    entity_id:
+      name: Tracker entity
+      description: The source tracker already configured in GPS Timeline.
+      required: true
+      selector:
+        entity:
+          filter:
+            - domain: device_tracker
+            - domain: person
+            - domain: sensor
+            - domain: geo_location
+    file_name:
+      name: JSON filename
+      description: Filename only, for example Timeline.json. No directory or upload.
+      required: true
+      example: Timeline.json
+      selector:
+        text:
+    places_entity:
+      name: Places history entity
+      description: >-
+        Entity ID for visit history. Defaults to the tracker’s configured Places
+        entity. Required if the file has visits and no Places entity is configured.
+        Only archive rows are written; no sensor is created. Use this same ID as
+        places_entity in the timeline card.
+      selector:
+        entity:
+    activity_entity:
+      name: Activity history entity
+      description: >-
+        Entity ID for activity history. Defaults to the tracker’s configured activity
+        entity. Required if the file has activities and none is configured.
+        Only archive rows are written; no sensor is created. Use this same ID as
+        activity_entity in the timeline card.
+      selector:
+        entity:
