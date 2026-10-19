@@ -52,11 +52,15 @@ import_google_timeline:
   description: >-
     Reads a Google on-device JSON export (semanticSegments) from the same directory
     as gps_timeline.db, normally /config/gps_timeline/. Imports timelinePath points,
-    visit locations and activity endpoints into points, and visits/activities into
-    ordinary companion history. No entities are created or updated. Existing rows
+    visit locations, activity endpoints and rawSignals.position into points, and
+    visits/activities into ordinary companion history. Raw positions retain accuracy,
+    speed, altitude and their full source metadata. rawSignals.activityRecord supplies
+    activity observations outside semantic activity intervals; the highest-confidence
+    candidate is selected and all candidates remain in metadata. These observations
+    have no invented duration. No entities are created or updated. Existing rows
     are preserved. Only one coordinate is kept per tracker/timestamp: timelinePath
-    takes precedence over activity endpoints, then visit locations; the first point
-    wins ties. The entire JSON is scanned in the background before changing the
+    takes precedence over raw positions, activity endpoints, then visit locations;
+    the first point wins ties. The entire JSON is scanned in the background before changing the
     archive. Invalid individual records are skipped; malformed JSON or import failure
     leaves the archive unchanged. Repeating an import adds only missing rows.
     Each call creates a separate google_timeline_import_*.jsonl.gz diagnostic log
@@ -65,9 +69,13 @@ import_google_timeline:
     and unused fields. Values are not sampled or truncated. The final log record
     reports completion and an inventory of all encountered JSON fields. Logs contain
     location data, are stored locally and are never uploaded automatically.
+    timelineMemory trip summaries, Wi-Fi scans and userLocationProfile aggregates
+    remain in the log with specific reasons: they do not define dated GPS points,
+    visits or activity observations that fit the upstream archive.
     The optional response reports days with new records (Home Assistant timezone),
     inserted points/states, skipped points, source segment/visit/activity counts,
-    diagnostic counts and the log_file path. Failures also report the log path.
+    raw position/activity counts, diagnostic counts and the log_file path.
+    Failures also report the log path.
   fields:
     entity_id:
       name: Tracker entity

@@ -461,7 +461,7 @@ async def test_whole_json_is_inventoried_and_unknown_values_are_not_truncated(ha
     assert inventory["$.rawSignals[*].sample"] == {"int": 1200}
     assert inventory["$.userLocationProfile.places[*].other"] == {"str": 1}
     assert inventory["$.semanticSegments[*].activity.topCandidate.probability"] == {"float": 2}
-    assert result["unsupported_items"] == 1205
+    assert result["unsupported_items"] == 1204
     assert result["points_inserted"] == 5
 
 
@@ -687,3 +687,223 @@ async def test_cancellation_while_creating_log_closes_it_without_starting_import
     assert records[-1]["status"] == "cancelled"
     assert records[-1]["committed"] is False
     assert archive_snapshot(path) == before
+
+
+def raw_position(time, coordinates="50.25°, 8.25°", **extra):
+    return {
+        "position": {
+            "LatLng": coordinates,
+            "timestamp": time,
+            "source": "GPS",
+            "accuracyMeters": 6,
+            "altitudeMeters": 500.5,
+            "speedMetersPerSecond": 2.5,
+            **extra,
+        }
+    }
+
+
+def raw_activity(time, kind="WALKING", confidence=0.9, candidates=None):
+    return {
+        "activityRecord": {
+            "timestamp": time,
+            "probableActivities": candidates
+            if candidates is not None
+            else [
+                {"type": kind, "confidence": confidence},
+            ],
+        }
+    }
+
+
+@pytest.mark.parametrize("raw_first", [False, True])
+async def test_raw_positions_fill_gaps_with_measurements_and_consistent_priority(
+    hass, raw_first
+):
+    raw = [
+        raw_position(timestamp(10)),  # Beats visit, but loses to timelinePath.
+        raw_position(timestamp(11)),  # Beats activity endpoint.
+        raw_position(timestamp(13)),
+        raw_position(timestamp(13), "60°, 6°"),  # First equal-priority observation wins.
+    ]
+    payload = {
+        "semanticSegments": [
+            visit(),
+            activity(timestamp(11), timestamp(12)),
+            {"timelinePath": [{"time": timestamp(10), "point": "50°, 8°"}]},
+        ],
+        "rawSignals": raw,
+    }
+    if raw_first:
+        payload = {"rawSignals": raw, "semanticSegments": payload["semanticSegments"]}
+    _, path = await setup_import(hass, payload)
+    before = archive_snapshot(path)
+    result = await call_import(hass)
+    assert result["raw_positions_read"] == 4
+    assert result["points_inserted"] == 4
+    with sqlite3.connect(path) as conn:
+        rows = conn.execute(
+            "SELECT lat,lon,accuracy,speed,altitude,attributes FROM points ORDER BY ts"
+        ).fetchall()
+    assert rows[0][:5] == (50, 8, None, None, None)
+    assert rows[1][:5] == rows[3][:5] == (50.25, 8.25, 6, 2.5, 500.5)
+    assert json.loads(rows[3][5])["google_timeline"]["position"] == raw[2]["position"]
+    assert archive_snapshot(path)["schema"] == before["schema"]
+    second = await call_import(hass)
+    assert second["points_inserted"] == 0
+    assert len(log_items(read_log(second["log_file"]), "existing_point")) == 4
+
+
+@pytest.mark.parametrize("raw_first", [False, True])
+async def test_raw_activity_observations_do_not_interrupt_semantic_intervals(hass, raw_first):
+    raw = [raw_activity(timestamp(hour), "RUNNING") for hour in range(8, 16)]
+    payload = {
+        "semanticSegments": [
+            activity(timestamp(10), timestamp(12), "IN_VEHICLE"),
+            activity(timestamp(11), timestamp(13), "CYCLING"),
+            activity(timestamp(15), timestamp(16), "STILL"),
+        ],
+        "rawSignals": raw,
+    }
+    if raw_first:
+        payload = {"rawSignals": raw, "semanticSegments": payload["semanticSegments"]}
+    await setup_import(hass, payload)
+    result = await call_import(hass)
+    records = read_log(result["log_file"])
+    assert result["raw_activity_records_read"] == 8
+    assert len(log_items(records, "raw_activity_covered_by_interval")) == 4
+    assert len(log_items(records, "raw_activity_at_semantic_boundary")) == 1
+    history = await hass.data[DOMAIN]["store"].async_query_states([ACTIVITY], 0, 2_000_000_000)
+    assert [row["s"] for row in history[ACTIVITY]] == [
+        "running",
+        "running",
+        "automotive",
+        "cycling",
+        "cycling",
+        "unknown",
+        "running",
+        "stationary",
+        "unknown",
+    ]
+    assert (
+        history[ACTIVITY][0]["a"]["google_timeline"]["activityRecord"]
+        == raw[0]["activityRecord"]
+    )
+    assert history[ACTIVITY][0]["a"]["confidence"] == 0.9
+    second = await call_import(hass)
+    assert second["activity_states_inserted"] == 0
+
+
+async def test_raw_activity_confidence_specificity_duplicates_and_invalid_siblings(hass):
+    raw = [
+        raw_activity(
+            timestamp(8),
+            candidates=[
+                {"type": "ON_FOOT", "confidence": 0.8},
+                {"type": "RUNNING", "confidence": 0.8},
+                {"type": "WALKING", "confidence": 0.7},
+                {"type": "STILL", "confidence": 5},
+            ],
+        ),
+        raw_activity(timestamp(9), "WALKING", 0.5),
+        raw_activity(timestamp(9), "STILL", 0.9),
+        raw_activity(timestamp(9), "RUNNING", 0.9),
+        raw_activity(timestamp(10), "UNKNOWN", 1),
+        raw_activity(timestamp(11), candidates=[]),
+        {"position": {"timestamp": timestamp(12), "LatLng": "91°, 8°"}},
+        raw_position(timestamp(13), accuracyMeters="invalid", altitudeMeters=-2),
+    ]
+    await setup_import(hass, {"semanticSegments": [], "rawSignals": raw})
+    result = await call_import(hass)
+    assert result["activity_states_inserted"] == 3
+    assert result["points_inserted"] == 1
+    assert result["raw_activity_records_read"] == 5
+    assert result["invalid_items"] == 4
+    records = read_log(result["log_file"])
+    assert len(log_items(records, "raw_activity_timestamp_collision")) == 2
+    history = await hass.data[DOMAIN]["store"].async_query_states(
+        [ACTIVITY, ENTITY], 0, 2_000_000_000
+    )
+    assert [row["s"] for row in history[ACTIVITY]] == ["running", "stationary", "unknown"]
+    assert (
+        history[ACTIVITY][0]["a"]["google_timeline"]["activityRecord"]
+        == raw[0]["activityRecord"]
+    )
+    assert history[ENTITY][0]["a"]["altitude"] == -2
+    assert "gps_accuracy" not in history[ENTITY][0]["a"]
+
+
+async def test_aggregate_data_have_specific_reasons_and_no_fabricated_archive_rows(hass):
+    memory = {
+        "startTime": timestamp(8),
+        "endTime": timestamp(12),
+        "timelineMemory": {
+            "trip": {
+                "distanceFromOriginKms": 100,
+                "destinations": [{"identifier": {"placeId": "synthetic"}}],
+            }
+        },
+    }
+    wifi = {
+        "wifiScan": {
+            "deliveryTime": timestamp(8),
+            "devicesRecords": [{"mac": 12345, "rawRssi": -50}],
+        }
+    }
+    profile = {"frequentPlaces": [{"placeId": "synthetic", "placeLocation": "50°, 8°"}]}
+    _, path = await setup_import(
+        hass,
+        {
+            "semanticSegments": [memory],
+            "rawSignals": [wifi],
+            "userLocationProfile": profile,
+        },
+        companions=False,
+    )
+    result = await call_import(hass)
+    records = read_log(result["log_file"])
+    assert result["invalid_items"] == result["unsupported_items"] == 0
+    assert result["points_inserted"] == result["activity_states_inserted"] == 0
+    assert (
+        log_items(records, "trip_summary_without_track")[0]["data"] == memory["timelineMemory"]
+    )
+    assert log_items(records, "wifi_scan_without_position")[0]["data"] == wifi["wifiScan"]
+    assert log_items(records, "profile_without_observation_time")[0]["data"] == profile
+    assert archive_snapshot(path)["version"] == 2
+
+
+async def test_raw_records_are_included_in_rollback_log_on_later_syntax_error(hass):
+    _, path = await setup_import(hass)
+    payload = {
+        "rawSignals": [raw_position(timestamp(10)), raw_activity(timestamp(11))],
+        "semanticSegments": [],
+    }
+    path.with_name("Timeline.json").write_text(json.dumps(payload) + " broken")
+    before = archive_snapshot(path)
+    with pytest.raises(HomeAssistantError):
+        await call_import(hass)
+    records = read_log(only_log(path))
+    assert len(log_items(records, "import_aborted")) == 2
+    assert records[-1]["committed"] is False
+    assert archive_snapshot(path) == before
+
+
+async def test_raw_activity_requires_existing_target_and_still_scans_to_end(hass):
+    _, path = await setup_import(
+        hass,
+        {
+            "semanticSegments": [],
+            "rawSignals": [raw_activity(timestamp(10)), raw_position(timestamp(11))],
+            "after": {"must": "be logged"},
+        },
+        companions=False,
+    )
+    with pytest.raises(HomeAssistantError, match="activity_entity"):
+        await call_import(hass)
+    records = read_log(only_log(path))
+    assert log_items(records, "missing_history_target")
+    assert log_items(records, "unsupported_top_level_field")[0]["data"] == {
+        "must": "be logged"
+    }
+    assert records[-1]["parse_complete"] is True
+    assert records[-1]["committed"] is False

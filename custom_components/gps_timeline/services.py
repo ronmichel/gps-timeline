@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter, defaultdict
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 import contextlib
 from datetime import UTC, datetime, timedelta
 import functools
@@ -350,7 +350,7 @@ class _GoogleImportLog:
                 {
                     "event": "header",
                     "log_format_version": 1,
-                    "importer_version": 2,
+                    "importer_version": 3,
                     "started_at": datetime.now(UTC).isoformat(),
                     "request": request,
                     "notes": [
@@ -465,10 +465,12 @@ class _GoogleJSONReader:
         stream: TextIO,
         cancelled: threading.Event | None = None,
         audit: _GoogleImportLog | None = None,
+        extra_item: Callable[[str, object, str], None] | None = None,
     ) -> None:
         self.stream = stream
         self.cancelled = cancelled
         self.audit = audit
+        self.extra_item = extra_item
         self.path = "$"
         self.offset = 0
         self.buffer = ""
@@ -584,26 +586,32 @@ class _GoogleJSONReader:
                         if self.audit:
                             item_path = f"{path}[{index}]"
                             self.audit.observe(value, item_path, f"{path}[*]")
-                            self.audit.item(
-                                "unsupported",
-                                "unsupported_top_level_item",
-                                item_path,
-                                value,
-                                reason="No importer for this section",
-                            )
-                    if not length and self.audit:
+                            if self.extra_item:
+                                self.extra_item(key, value, item_path)
+                            else:
+                                self.audit.item(
+                                    "unsupported",
+                                    "unsupported_top_level_item",
+                                    item_path,
+                                    value,
+                                    reason="No importer for this section",
+                                )
+                    if not length and self.audit and key != "rawSignals":
                         self.audit.item("unsupported", "unsupported_top_level_field", path, [])
                 else:
                     value = self.value()
                     if self.audit:
                         self.audit.observe(value, path, path)
-                        self.audit.item(
-                            "unsupported",
-                            "unsupported_top_level_field",
-                            path,
-                            value,
-                            reason="No importer for this section; entire subtree logged",
-                        )
+                        if self.extra_item:
+                            self.extra_item(key, value, path)
+                        else:
+                            self.audit.item(
+                                "unsupported",
+                                "unsupported_top_level_field",
+                                path,
+                                value,
+                                reason="No importer for this section; entire subtree logged",
+                            )
                 if self.peek() == "}":
                     break
                 self.take(",")
@@ -674,6 +682,263 @@ def _google_json(value) -> str:
     return json.dumps(value, separators=(",", ":"), sort_keys=True, allow_nan=False)
 
 
+def _google_activity_state(google_type) -> str:
+    if not isinstance(google_type, str) or not google_type:
+        raise ValueError("Activity type must be a nonempty string")
+    return {
+        "IN_VEHICLE": "automotive",
+        "IN_PASSENGER_VEHICLE": "automotive",
+        "IN_ROAD_VEHICLE": "automotive",
+        "WALKING": "walking",
+        "RUNNING": "running",
+        "CYCLING": "cycling",
+        "ON_BICYCLE": "cycling",
+        "STILL": "stationary",
+        "UNKNOWN": "unknown",
+        "UNKNOWN_ACTIVITY_TYPE": "unknown",
+    }.get(google_type, google_type.lower())
+
+
+def _google_number(value, *, nonnegative: bool = False) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("Expected a number")
+    if not math.isfinite(value) or (nonnegative and value < 0):
+        raise ValueError("Expected a finite number in the valid range")
+    return float(value)
+
+
+def _stage_google_extra(
+    conn: sqlite3.Connection,
+    targets: dict,
+    audit: _GoogleImportLog,
+    section: str,
+    value,
+    path: str,
+) -> None:
+    """Handle root sections without guessing times or geocoding place IDs/Wi-Fi."""
+    if section == "userLocationProfile":
+        audit.item(
+            "not_imported",
+            "profile_without_observation_time",
+            path,
+            value,
+            reason="Frequent places/trips and travel preferences are aggregates, not dated"
+            " observations; no historical points or visits can be derived from them",
+        )
+        return
+    if section != "rawSignals":
+        audit.item(
+            "unsupported",
+            "unsupported_top_level_field"
+            if path == _google_json_path("$", section)
+            else "unsupported_top_level_item",
+            path,
+            value,
+            reason="No importer for this section; entire subtree logged",
+        )
+        return
+    if path == "$.rawSignals" or not isinstance(value, dict):
+        audit.item(
+            "invalid",
+            "invalid_raw_signal",
+            path,
+            value,
+            reason="rawSignals must be an array of objects",
+        )
+        return
+    audit.result["raw_signals_read"] += 1
+    known = {"position", "activityRecord", "wifiScan"}
+    if not known.intersection(value):
+        audit.item(
+            "unsupported",
+            "unsupported_top_level_item",
+            path,
+            value,
+            reason="No recognized raw signal type; entire item logged",
+        )
+        return
+    for kind, data in value.items():
+        source = {"path": _google_json_path(path, kind), "data": data}
+        if kind == "position":
+            _stage_google_position(conn, data, source, audit)
+        elif kind == "activityRecord":
+            _stage_google_activity_record(conn, targets, data, source, audit)
+        else:
+            audit.item(
+                "not_imported" if kind == "wifiScan" else "unsupported",
+                "wifi_scan_without_position"
+                if kind == "wifiScan"
+                else "unsupported_raw_signal_field",
+                **source,
+                reason="Wi-Fi MAC/RSSI observations have no coordinates; no geolocation"
+                " lookup is performed"
+                if kind == "wifiScan"
+                else "No mapping for this raw signal field",
+            )
+
+
+def _stage_google_position(
+    conn: sqlite3.Connection,
+    data,
+    source: dict,
+    audit: _GoogleImportLog,
+) -> None:
+    try:
+        if not isinstance(data, dict):
+            raise ValueError("Expected a position object")
+        time = _google_time(data["timestamp"])
+        time.timestamp()
+        coords = _google_coordinates(data["LatLng"])
+    except (KeyError, TypeError, ValueError, OverflowError) as err:
+        audit.item("invalid", "invalid_raw_position", **source, reason=str(err))
+        return
+    attrs = {"google_timeline": {"position": data}}
+    for field, target in (
+        ("accuracyMeters", "gps_accuracy"),
+        ("speedMetersPerSecond", "speed"),
+        ("altitudeMeters", "altitude"),
+    ):
+        if field in data:
+            try:
+                attrs[target] = _google_number(data[field], nonnegative=target != "altitude")
+            except (ValueError, OverflowError) as err:
+                audit.item(
+                    "invalid",
+                    "invalid_position_measurement",
+                    _google_json_path(source["path"], field),
+                    data[field],
+                    reason=f"{err}; coordinates still imported, value kept as metadata",
+                )
+    _stage_google_point(conn, time, coords, "position", 3, source, audit, attrs)
+    audit.result["raw_positions_read"] += 1
+    audit.result["points_read"] += 1
+
+
+def _stage_google_activity_record(
+    conn: sqlite3.Connection,
+    targets: dict,
+    data,
+    source: dict,
+    audit: _GoogleImportLog,
+) -> None:
+    try:
+        if not isinstance(data, dict):
+            raise ValueError("Expected an activityRecord object")
+        ts = _google_time(data["timestamp"]).timestamp()
+        candidates = data["probableActivities"]
+        if not isinstance(candidates, list):
+            raise ValueError("probableActivities must be an array")
+        valid = []
+        for index, candidate in enumerate(candidates):
+            try:
+                if not isinstance(candidate, dict):
+                    raise ValueError("Expected an activity candidate object")
+                state = _google_activity_state(candidate["type"])
+                confidence = _google_number(candidate["confidence"], nonnegative=True)
+                if confidence > 1:
+                    raise ValueError("Activity confidence must be between 0 and 1")
+                # Prefer WALKING/RUNNING over ON_FOOT, or rail/road over IN_VEHICLE,
+                # only when confidence is equal. Keep the first remaining tie.
+                specific = candidate["type"] not in ("ON_FOOT", "IN_VEHICLE")
+                valid.append((confidence, specific, -index, state, candidate["type"]))
+            except (KeyError, TypeError, ValueError, OverflowError) as err:
+                audit.item(
+                    "invalid",
+                    "invalid_activity_candidate",
+                    f"{source['path']}.probableActivities[{index}]",
+                    candidate,
+                    reason=str(err),
+                )
+        if not valid:
+            raise ValueError("No valid activity candidates")
+        confidence, _, _, state, google_type = max(valid)
+    except (KeyError, TypeError, ValueError, OverflowError) as err:
+        audit.item("invalid", "invalid_raw_activity", **source, reason=str(err))
+        return
+    if not targets["activity"]:
+        reason = "Configure activity_entity on the tracker or supply it in the service call"
+        audit.blocking_errors.add(reason)
+        audit.item("not_imported", "missing_history_target", **source, reason=reason)
+        return
+    audit.result["raw_activity_records_read"] += 1
+    attrs = _google_json(
+        {
+            "source": "google_timeline",
+            "google_timeline_type": "activityRecord",
+            "google_activity_type": google_type,
+            "confidence": confidence,
+            "google_timeline": {"activityRecord": data},
+        }
+    )
+    old = conn.execute(
+        "SELECT confidence, source FROM google_raw_activities WHERE ts=?",
+        (ts,),
+    ).fetchone()
+    if old:
+        discarded = json.loads(old[1]) if confidence > old[0] else source
+        audit.item(
+            "duplicate",
+            "raw_activity_timestamp_collision",
+            **discarded,
+            reason="One activity per timestamp; highest confidence, first tie wins",
+            timestamp=ts,
+        )
+        if confidence <= old[0]:
+            return
+    conn.execute(
+        "INSERT INTO google_raw_activities VALUES (?, ?, ?, ?, ?)"
+        " ON CONFLICT(ts) DO UPDATE SET state=excluded.state, attributes=excluded.attributes,"
+        " source=excluded.source, confidence=excluded.confidence",
+        (ts, state, attrs, _google_json(source), confidence),
+    )
+
+
+def _stage_google_raw_states(
+    conn: sqlite3.Connection,
+    targets: dict,
+    audit: _GoogleImportLog,
+) -> None:
+    """Raw activity observations fill gaps; they must not override semantic intervals."""
+    intervals = iter(
+        conn.execute(
+            "SELECT start, end, source FROM google_intervals"
+            " WHERE kind='activity' ORDER BY start"
+        )
+    )
+    upcoming = next(intervals, None)
+    covered_until, covered_source = float("-inf"), None
+    for ts, state, attrs, raw in conn.execute(
+        "SELECT ts, state, attributes, source FROM google_raw_activities ORDER BY ts"
+    ):
+        if audit.cancelled is not None and audit.cancelled.is_set():
+            raise ValueError("Import cancelled")
+        while upcoming is not None and upcoming[0] <= ts:
+            if upcoming[1] > covered_until:
+                covered_until, covered_source = upcoming[1], upcoming[2]
+            upcoming = next(intervals, None)
+        source = json.loads(raw)
+        if ts < covered_until:
+            audit.item(
+                "not_imported",
+                "raw_activity_covered_by_interval",
+                **source,
+                reason="A semantic activity interval covers this observation and wins",
+                kept_json_path=json.loads(covered_source)["path"],
+            )
+            continue
+        inserted = conn.execute(
+            "INSERT OR IGNORE INTO google_states VALUES (?, ?, ?, ?, 'activity', ?)",
+            (targets["activity"], ts, state, attrs, _google_json([source])),
+        ).rowcount
+        if not inserted:
+            audit.item(
+                "duplicate",
+                "raw_activity_at_semantic_boundary",
+                **source,
+                reason="A semantic activity boundary at this timestamp takes precedence",
+            )
+
+
 def _stage_google_point(
     conn: sqlite3.Connection,
     time: datetime,
@@ -682,6 +947,7 @@ def _stage_google_point(
     priority: int,
     source: dict,
     audit: _GoogleImportLog,
+    attributes: dict | None = None,
 ) -> None:
     """Keep one point per timestamp and log the original value of every loser."""
     ts = time.timestamp()
@@ -699,26 +965,37 @@ def _stage_google_point(
             if (lat, lon) == (old_lat, old_lon)
             else "point_timestamp_collision",
             **discarded,
-            reason="One coordinate per timestamp; path > activity > visit, first wins ties",
+            reason="One coordinate per timestamp; path > raw position > activity > visit;"
+            " first wins ties",
             timestamp=ts,
             kept_json_path=kept["path"],
         )
         if priority <= old_priority:
             return
-    attrs = _google_json(
-        {
-            "latitude": lat,
-            "longitude": lon,
-            "source_type": "gps",
-            "source": "google_timeline",
-            "google_timeline_type": kind,
-        }
-    )
+    attrs = {
+        "latitude": lat,
+        "longitude": lon,
+        "source_type": "gps",
+        "source": "google_timeline",
+        "google_timeline_type": kind,
+        **(attributes or {}),
+    }
     conn.execute(
-        "INSERT INTO google_points VALUES (?, ?, ?, ?, ?, ?)"
+        "INSERT INTO google_points VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
         " ON CONFLICT(ts) DO UPDATE SET lat=excluded.lat, lon=excluded.lon,"
-        " attributes=excluded.attributes, priority=excluded.priority, source=excluded.source",
-        (ts, lat, lon, attrs, priority, _google_json(source)),
+        " attributes=excluded.attributes, priority=excluded.priority, source=excluded.source,"
+        " accuracy=excluded.accuracy, speed=excluded.speed, altitude=excluded.altitude",
+        (
+            ts,
+            lat,
+            lon,
+            _google_json(attrs),
+            priority,
+            _google_json(source),
+            attrs.get("gps_accuracy"),
+            attrs.get("speed"),
+            attrs.get("altitude"),
+        ),
     )
 
 
@@ -747,7 +1024,17 @@ def _stage_google_segment(
             "endTimeTimezoneUtcOffsetMinutes",
         )
     }
-    known = {"timelinePath", "visit", "activity", *common}
+    known = {"timelinePath", "visit", "activity", "timelineMemory", *common}
+    if "timelineMemory" in segment:
+        audit.item(
+            "not_imported",
+            "trip_summary_without_track",
+            f"{path}.timelineMemory",
+            segment["timelineMemory"],
+            context=common,
+            reason="Aggregate trip summary: place IDs/distance do not define a GPS route"
+            " or an activity state; retained in this log only",
+        )
     for key, value in segment.items():
         if key not in known:
             audit.item(
@@ -759,6 +1046,8 @@ def _stage_google_segment(
                 reason="No mapping for this segment field; entire subtree logged",
             )
     if not any(key in segment for key in ("timelinePath", "visit", "activity")):
+        if "timelineMemory" in segment:
+            return counts
         audit.item(
             "unsupported",
             "unsupported_segment",
@@ -821,7 +1110,7 @@ def _stage_google_segment(
                             _google_json_path(f"{item_path}.point", key),
                             value,
                         )
-            _stage_google_point(conn, time, coords, "timelinePath", 3, source, audit)
+            _stage_google_point(conn, time, coords, "timelinePath", 4, source, audit)
             counts["points_read"] += 1
 
     archived_interval = False
@@ -887,18 +1176,7 @@ def _stage_google_segment(
                 rank = int(data.get("hierarchyLevel", 0))
             else:
                 google_type = candidate.get("type", "UNKNOWN_ACTIVITY_TYPE")
-                if not isinstance(google_type, str):
-                    raise ValueError("Activity type must be a string")
-                state = {
-                    "IN_VEHICLE": "automotive",
-                    "IN_PASSENGER_VEHICLE": "automotive",
-                    "WALKING": "walking",
-                    "RUNNING": "running",
-                    "CYCLING": "cycling",
-                    "ON_BICYCLE": "cycling",
-                    "STILL": "stationary",
-                    "UNKNOWN_ACTIVITY_TYPE": "unknown",
-                }.get(google_type, google_type.lower())
+                state = _google_activity_state(google_type)
                 for time, role in ((start, "start"), (end, "end")):
                     location = data.get(role)
                     if location is not None:
@@ -1061,7 +1339,15 @@ def _import_google_archive(
     )
     result = audit.result
     result.update(
-        {"points_read": 0, "visits_read": 0, "activities_read": 0, "segments_read": 0}
+        {
+            "points_read": 0,
+            "visits_read": 0,
+            "activities_read": 0,
+            "segments_read": 0,
+            "raw_signals_read": 0,
+            "raw_positions_read": 0,
+            "raw_activity_records_read": 0,
+        }
     )
     with contextlib.closing(
         sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=rw", uri=True, timeout=30)
@@ -1073,16 +1359,24 @@ def _import_google_archive(
         # Provenance is TEMP-only. It never changes the archive's schema or rows.
         conn.executescript(
             "CREATE TEMP TABLE google_points (ts REAL PRIMARY KEY, lat REAL, lon REAL,"
-            " attributes TEXT, priority INTEGER, source TEXT);"
+            " attributes TEXT, priority INTEGER, source TEXT, accuracy REAL, speed REAL,"
+            " altitude REAL);"
             "CREATE TEMP TABLE google_intervals (id INTEGER PRIMARY KEY, kind TEXT,"
             " start REAL, end REAL, state TEXT, attributes TEXT, rank INTEGER, source TEXT,"
             " UNIQUE(kind, start, end, state, attributes));"
             "CREATE TEMP TABLE google_states (entity_id TEXT, ts REAL, state TEXT,"
             " attributes TEXT, kind TEXT, source TEXT, PRIMARY KEY(entity_id, ts));"
+            "CREATE TEMP TABLE google_raw_activities (ts REAL PRIMARY KEY, state TEXT,"
+            " attributes TEXT, source TEXT, confidence REAL);"
         )
         try:
             with source.open(encoding="utf-8-sig") as stream:
-                reader = _GoogleJSONReader(stream, cancelled, audit)
+                reader = _GoogleJSONReader(
+                    stream,
+                    cancelled,
+                    audit,
+                    functools.partial(_stage_google_extra, conn, targets, audit),
+                )
                 try:
                     for index, segment in enumerate(reader.segments()):
                         path = f"$.semanticSegments[{index}]"
@@ -1109,6 +1403,7 @@ def _import_google_archive(
             if audit.blocking_errors:
                 raise ValueError("; ".join(sorted(audit.blocking_errors)))
             _stage_google_states(conn, targets, cancelled)
+            _stage_google_raw_states(conn, targets, audit)
             conn.commit()  # Only TEMP data has been written so far.
             # Interrupting SQLite can roll back its transaction. Keep committed TEMP
             # provenance available so every accepted source can be logged on abort.
@@ -1179,8 +1474,10 @@ def _import_google_archive(
                     days.add(datetime.fromtimestamp(ts, zone).date().isoformat())
                 result["points_inserted"] = conn.execute(
                     "INSERT OR IGNORE INTO points"
-                    " (tracker_id, ts, state, lat, lon, source_type, attributes)"
-                    " SELECT ?, ts, 'not_home', lat, lon, 'gps', attributes"
+                    " (tracker_id, ts, state, lat, lon, source_type, attributes,"
+                    " accuracy, speed, altitude)"
+                    " SELECT ?, ts, 'not_home', lat, lon, 'gps', attributes,"
+                    " accuracy, speed, altitude"
                     " FROM google_points",
                     (tracker_id,),
                 ).rowcount
@@ -1209,6 +1506,7 @@ def _import_google_archive(
             for (raw,) in conn.execute(
                 "SELECT source FROM google_points"
                 " UNION ALL SELECT source FROM google_intervals"
+                " UNION ALL SELECT source FROM google_raw_activities"
             ):
                 audit.item(
                     "not_imported",
