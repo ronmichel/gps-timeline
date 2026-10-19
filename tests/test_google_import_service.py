@@ -29,6 +29,7 @@ from tests.test_services import make_state
 ENTITY = "device_tracker.phone"
 PLACES = "sensor.places_phone"
 ACTIVITY = "sensor.activity_phone"
+CAR = "device_tracker.car"
 
 
 def timestamp(hour, minute=0):
@@ -63,6 +64,24 @@ def activity(start, end, kind="WALKING"):
             "distanceMeters": 2000,
         },
     }
+
+
+def parked_activity(time, coordinates="54.12345678°, 12.2°"):
+    segment = activity(timestamp(10), timestamp(11), "IN_PASSENGER_VEHICLE")
+    segment["activity"]["parking"] = {
+        "startTime": time,
+        "location": {"latLng": coordinates},
+        "extra": {"retained": "whole parking object"},
+    }
+    return segment
+
+
+async def setup_car(hass):
+    entry = MockConfigEntry(domain=DOMAIN, data={CONF_ENTITY_ID: CAR}, title="Car")
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    return entry
 
 
 def export():
@@ -379,8 +398,16 @@ async def test_live_writes_continue_during_staging_and_take_precedence(hass, mon
     assert archive_snapshot(path)["points"][0][4:6] == (61, 6)
 
 
-async def test_cancellation_waits_for_worker_and_leaves_archive_unchanged(hass, monkeypatch):
-    _, path = await setup_import(hass)
+@pytest.mark.parametrize("with_car", [False, True])
+async def test_cancellation_waits_for_worker_and_leaves_archive_unchanged(
+    hass, monkeypatch, with_car
+):
+    payload = export()
+    if with_car:
+        payload["semanticSegments"][0] = parked_activity(timestamp(10))
+    _, path = await setup_import(hass, payload)
+    if with_car:
+        await setup_car(hass)
     before = archive_snapshot(path)
     entered, resume = threading.Event(), threading.Event()
     stage = services._stage_google_segment
@@ -392,7 +419,9 @@ async def test_cancellation_waits_for_worker_and_leaves_archive_unchanged(hass, 
         return counts
 
     monkeypatch.setattr(services, "_stage_google_segment", pause)
-    task = asyncio.create_task(call_import(hass))
+    task = asyncio.create_task(
+        call_import(hass, **({"car_entity_id": CAR} if with_car else {}))
+    )
     assert await hass.async_add_executor_job(entered.wait, 10)
     task.cancel()
     await asyncio.sleep(0)
@@ -405,6 +434,10 @@ async def test_cancellation_waits_for_worker_and_leaves_archive_unchanged(hass, 
     assert records[-1]["committed"] is False
     assert log_items(records, "import_aborted")
     assert log_items(records, "unparsed_json_text")
+    if with_car:
+        assert any(
+            item.get("entity_id") == CAR for item in log_items(records, "import_aborted")
+        )
 
 
 async def test_every_call_has_a_private_complete_log_including_existing_rows(hass):
@@ -907,3 +940,195 @@ async def test_raw_activity_requires_existing_target_and_still_scans_to_end(hass
     }
     assert records[-1]["parse_complete"] is True
     assert records[-1]["committed"] is False
+
+
+async def test_parking_goes_only_to_car_at_its_own_time_and_can_be_imported_later(hass):
+    payload = export()
+    parking = [
+        parked_activity(timestamp(11)),  # Same timestamp as a different person coordinate.
+        parked_activity("2020-01-03T00:30:00+02:00", "55°, 13°"),
+    ]
+    payload["semanticSegments"].extend(parking)
+    await hass.config.async_set_time_zone("Europe/Berlin")
+    _, path = await setup_import(hass, payload)
+    await setup_car(hass)
+    entities = set(er.async_get(hass).entities)
+    live_states = set(hass.states.async_entity_ids())
+    before = archive_snapshot(path)
+    # An existing car configuration alone must not implicitly select it.
+    first = await call_import(hass)
+    assert first["parking_records_read"] == first["parking_points_skipped"] == 2
+    assert first["parking_points_inserted"] == first["parking_days"] == 0
+    records = read_log(first["log_file"])
+    skipped = log_items(records, "parking_without_car_target")
+    assert [item["data"] for item in skipped] == [s["activity"]["parking"] for s in parking]
+    store = hass.data[DOMAIN]["store"]
+    person = await store.async_query_states([ENTITY, PLACES, ACTIVITY], 0, 2_000_000_000)
+    assert await store.async_query_states([CAR], 0, 2_000_000_000) == {}
+
+    second = await call_import(hass, car_entity_id=CAR)
+    assert second["car_entity_id"] == CAR
+    assert second["points_inserted"] == second["days"] == 0
+    assert second["visit_states_inserted"] == second["activity_states_inserted"] == 0
+    assert second["parking_points_inserted"] == 2
+    assert second["parking_points_skipped"] == 0
+    # The second UTC/local timestamp is on January 2 in HA's Berlin timezone.
+    assert second["parking_days"] == 1
+    assert (
+        await store.async_query_states([ENTITY, PLACES, ACTIVITY], 0, 2_000_000_000) == person
+    )
+    car = (await store.async_query_states([CAR], 0, 2_000_000_000))[CAR]
+    assert [p["lu"] for p in car] == [
+        datetime.fromisoformat(s["activity"]["parking"]["startTime"]).timestamp()
+        for s in parking
+    ]
+    assert [p["a"]["latitude"] for p in car] == [54.123457, 55.0]
+    assert [p["a"]["google_timeline"]["parking"] for p in car] == [
+        s["activity"]["parking"] for s in parking
+    ]
+    assert all(p["a"]["google_timeline_type"] == "parking" for p in car)
+    with sqlite3.connect(path) as conn:
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM entity_states AS s JOIN trackers AS t"
+                " ON s.tracker_id=t.id WHERE t.entity_id=?",
+                (CAR,),
+            ).fetchone()[0]
+            == 0
+        )
+    after = archive_snapshot(path)
+    assert after["schema"] == before["schema"]
+    assert after["version"] == 2
+    assert set(er.async_get(hass).entities) == entities
+    assert set(hass.states.async_entity_ids()) == live_states
+    again = await call_import(hass, car_entity_id=CAR)
+    assert again["parking_points_inserted"] == again["parking_days"] == 0
+    assert again["parking_points_skipped"] == 2
+    assert len(log_items(read_log(again["log_file"]), "existing_parking_point")) == 2
+    assert archive_snapshot(path) == after
+
+
+async def test_parking_duplicates_invalid_items_and_invalid_parent_are_independent(hass):
+    segments = [
+        parked_activity(timestamp(12)),
+        parked_activity(timestamp(12)),
+        parked_activity(timestamp(12), "56°, 14°"),
+        parked_activity(timestamp(13)),
+        parked_activity(timestamp(14)),
+    ]
+    # Parking has its own timestamp and coordinates even if the activity is invalid.
+    segments[4]["endTime"] = "invalid parent time"
+    invalid = [
+        None,
+        {},
+        {"startTime": timestamp(15), "location": "91°, 2°"},
+        {"startTime": "2020-01-02T15:00:00", "location": "55°, 13°"},
+    ]
+    for value in invalid:
+        segment = parked_activity(timestamp(15))
+        segment["activity"]["parking"] = value
+        segments.append(segment)
+    _, path = await setup_import(hass, {"semanticSegments": segments})
+    await setup_car(hass)
+    with sqlite3.connect(path) as conn:
+        car_id = conn.execute("SELECT id FROM trackers WHERE entity_id=?", (CAR,)).fetchone()[
+            0
+        ]
+        conn.execute(
+            "INSERT INTO points(tracker_id, ts, state, lat, lon, attributes)"
+            " VALUES (?, ?, 'home', 60, 15, '{}')",
+            (car_id, datetime.fromisoformat(timestamp(13)).timestamp()),
+        )
+        existing = conn.execute(
+            "SELECT * FROM points WHERE tracker_id=?", (car_id,)
+        ).fetchone()
+    result = await call_import(hass, car_entity_id=CAR)
+    assert result["parking_records_read"] == 9
+    assert result["parking_points_inserted"] == 2
+    assert result["parking_points_skipped"] == 7
+    assert result["invalid_items"] == 5  # Four parking items and one parent activity.
+    records = read_log(result["log_file"])
+    assert [r["data"] for r in log_items(records, "invalid_parking")] == invalid
+    assert len(log_items(records, "duplicate_parking_point")) == 1
+    collision = log_items(records, "parking_timestamp_collision")[0]
+    assert collision["data"] == segments[2]["activity"]["parking"]
+    assert collision["entity_id"] == CAR
+    assert collision["kept_json_path"] == "$.semanticSegments[0].activity.parking"
+    assert len(log_items(records, "existing_parking_point")) == 1
+    with sqlite3.connect(path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM points WHERE tracker_id=? ORDER BY ts", (car_id,)
+        ).fetchall()
+    assert len(rows) == 3
+    assert rows[1] == existing
+    assert rows[0][4:6] == (54.123457, 12.2)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"car_entity_id": ENTITY}, "must differ"),
+        ({"car_entity_id": PLACES}, "device_tracker entity"),
+        ({"car_entity_id": CAR}, "not tracked"),
+        ({"car_entity_id": CAR, CONF_PLACES_ENTITY: CAR}, "must differ"),
+    ],
+)
+async def test_car_selection_rejects_ambiguous_or_unconfigured_targets(hass, overrides, error):
+    _, path = await setup_import(hass)
+    before = archive_snapshot(path)
+    with pytest.raises(HomeAssistantError, match=error):
+        await call_import(hass, **overrides)
+    assert archive_snapshot(path) == before
+    assert read_log(only_log(path))[-1]["committed"] is False
+
+
+async def test_failure_after_car_insert_rolls_back_person_and_car_with_full_log(
+    hass, monkeypatch
+):
+    payload = {"semanticSegments": [parked_activity(timestamp(12))]}
+    _, path = await setup_import(hass, payload)
+    await setup_car(hass)
+    before = archive_snapshot(path)
+    connect = sqlite3.connect
+
+    class FailAfterCar(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):
+            result = super().execute(sql, *args, **kwargs)
+            if sql.startswith("INSERT OR IGNORE INTO points") and "google_parking" in sql:
+                raise sqlite3.OperationalError("simulated error after writing both trackers")
+            return result
+
+    monkeypatch.setattr(
+        services.sqlite3, "connect", lambda *a, **kw: connect(*a, **kw, factory=FailAfterCar)
+    )
+    with pytest.raises(HomeAssistantError, match="writing both trackers"):
+        await call_import(hass, car_entity_id=CAR)
+    assert archive_snapshot(path) == before
+    records = read_log(only_log(path))
+    assert records[-1]["committed"] is False
+    assert records[-1]["result"]["points_inserted"] == 0
+    assert records[-1]["result"]["parking_points_inserted"] == 0
+    aborted = [
+        item for item in log_items(records, "import_aborted") if item.get("entity_id") == CAR
+    ]
+    assert len(aborted) == 1
+    assert aborted[0]["data"] == payload["semanticSegments"][0]["activity"]["parking"]
+
+
+async def test_car_archive_binding_is_rechecked_before_commit(hass, monkeypatch):
+    _, path = await setup_import(hass, {"semanticSegments": [parked_activity(timestamp(12))]})
+    await setup_car(hass)
+    before = archive_snapshot(path)
+    stage = services._stage_google_segment
+
+    def unbind_during_staging(*args):
+        counts = stage(*args)
+        with sqlite3.connect(path) as other:
+            other.execute("UPDATE trackers SET entry_id=NULL WHERE entity_id=?", (CAR,))
+        return counts
+
+    monkeypatch.setattr(services, "_stage_google_segment", unbind_during_staging)
+    with pytest.raises(HomeAssistantError, match="no longer separately bound"):
+        await call_import(hass, car_entity_id=CAR)
+    assert archive_snapshot(path) == before
+    assert read_log(only_log(path))[-1]["committed"] is False

@@ -57,7 +57,12 @@ import_google_timeline:
     speed, altitude and their full source metadata. rawSignals.activityRecord supplies
     activity observations outside semantic activity intervals; the highest-confidence
     candidate is selected and all candidates remain in metadata. These observations
-    have no invented duration. No entities are created or updated. Existing rows
+    have no invented duration. Optionally, activity.parking locations are imported
+    exclusively into a separately configured car tracker, using parking.startTime
+    even when it differs from the activity end. No person routes, visits or activities
+    are copied to the car. Without car_entity_id, parking coordinates are skipped
+    and logged; their original metadata remains in the person's activity history.
+    No entities are created or updated. Existing rows
     are preserved. Only one coordinate is kept per tracker/timestamp: timelinePath
     takes precedence over raw positions, activity endpoints, then visit locations;
     the first point wins ties. The entire JSON is scanned in the background before changing the
@@ -75,7 +80,9 @@ import_google_timeline:
     The optional response reports days with new records (Home Assistant timezone),
     inserted points/states, skipped points, source segment/visit/activity counts,
     raw position/activity counts, diagnostic counts and the log_file path.
-    Failures also report the log path.
+    Car results are separate: parking_records_read, parking_points_inserted,
+    parking_points_skipped and parking_days. Both tracker archives are committed
+    together; a failure leaves both unchanged. Failures also report the log path.
   fields:
     entity_id:
       name: Tracker entity
@@ -95,6 +102,20 @@ import_google_timeline:
       example: Timeline.json
       selector:
         text:
+    car_entity_id:
+      name: Car tracker (parking only)
+      description: >-
+        Optional device_tracker entity already configured separately in GPS Timeline,
+        for example device_tracker.car. Use the entity ID, not a device registry ID.
+        Only activity.parking coordinates and their own startTime are written to this
+        car's archive. It must differ from the person tracker and history entities.
+        No driving route or parking duration is inferred. If multiple parking points
+        have the same timestamp, the first wins; existing car points are preserved.
+      required: false
+      selector:
+        entity:
+          filter:
+            - domain: device_tracker
     places_entity:
       name: Places history entity
       description: >-

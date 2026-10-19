@@ -65,12 +65,14 @@ PURGE_SCHEMA = vol.Schema(
 )
 
 GOOGLE_IMPORT_SERVICE = "import_google_timeline"
+CONF_CAR_ENTITY_ID = "car_entity_id"
 GOOGLE_IMPORT_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_ENTITY_ID): cv.entity_id,
         vol.Required("file_name"): cv.string,
         vol.Optional(CONF_PLACES_ENTITY): cv.entity_id,
         vol.Optional(CONF_ACTIVITY_ENTITY): cv.entity_id,
+        vol.Optional(CONF_CAR_ENTITY_ID): cv.entity_id,
     }
 )
 
@@ -264,6 +266,17 @@ async def _async_run_google_import(
         if claims.get(target, entry.entry_id) != entry.entry_id:
             raise HomeAssistantError(f"{target} is already tracked by another entry")
 
+    car_target = None
+    if car_entity_id := call.data.get(CONF_CAR_ENTITY_ID, "").lower():
+        if not car_entity_id.startswith("device_tracker."):
+            raise HomeAssistantError("car_entity_id must identify a device_tracker entity")
+        if car_entity_id in (entity_id, *assigned):
+            raise HomeAssistantError("The car tracker must differ from all person targets")
+        car_entry = _find_entry(hass, car_entity_id)
+        if car_entry is None:
+            raise HomeAssistantError(f"{car_entity_id} is not tracked by GPS Timeline")
+        car_target = {"entry_id": car_entry.entry_id, "entity_id": car_entity_id}
+
     await store.async_flush()
     cancelled = threading.Event()
     job = hass.async_add_executor_job(
@@ -276,6 +289,7 @@ async def _async_run_google_import(
         hass.config.time_zone,
         cancelled,
         audit,
+        car_target,
     )
     try:
         # wait() leaves the worker future intact when the service is cancelled.
@@ -350,7 +364,7 @@ class _GoogleImportLog:
                 {
                     "event": "header",
                     "log_format_version": 1,
-                    "importer_version": 3,
+                    "importer_version": 4,
                     "started_at": datetime.now(UTC).isoformat(),
                     "request": request,
                     "notes": [
@@ -423,6 +437,8 @@ class _GoogleImportLog:
                 "visit_states_inserted",
                 "activity_states_inserted",
                 "days",
+                "parking_points_inserted",
+                "parking_days",
             ):
                 self.result[key] = 0
         self.result.update(
@@ -999,6 +1015,73 @@ def _stage_google_point(
     )
 
 
+def _stage_google_parking(
+    conn: sqlite3.Connection,
+    segment,
+    audit: _GoogleImportLog,
+    path: str,
+    car_target: dict | None,
+) -> None:
+    """Parking is an independent observation for the explicitly selected car only."""
+    if not isinstance(segment, dict):
+        return
+    activity = segment.get("activity")
+    if not isinstance(activity, dict) or "parking" not in activity:
+        return
+    parking = activity["parking"]
+    audit.result["parking_records_read"] += 1
+    source = {
+        "path": f"{path}.activity.parking",
+        "data": parking,
+        "context": {key: segment.get(key) for key in ("startTime", "endTime")},
+        "entity_id": car_target["entity_id"] if car_target else None,
+    }
+    try:
+        if not isinstance(parking, dict):
+            raise ValueError("Expected a parking object")
+        ts = _google_time(parking["startTime"]).timestamp()
+        lat, lon = _google_coordinates(parking["location"])
+    except (KeyError, TypeError, ValueError, OverflowError) as err:
+        audit.item("invalid", "invalid_parking", **source, reason=str(err))
+        return
+    if car_target is None:
+        audit.item(
+            "not_imported",
+            "parking_without_car_target",
+            **source,
+            reason="No car_entity_id supplied; parking GPS points are never assigned"
+            " to the source tracker. Original parking metadata remains in valid activities",
+        )
+        return
+    previous = conn.execute(
+        "SELECT lat, lon, source FROM google_parking WHERE ts=?", (ts,)
+    ).fetchone()
+    if previous:
+        audit.item(
+            "duplicate",
+            "duplicate_parking_point"
+            if (lat, lon) == previous[:2]
+            else "parking_timestamp_collision",
+            **source,
+            timestamp=ts,
+            kept_json_path=json.loads(previous[2])["path"],
+            reason="One car coordinate per timestamp; the first parking record wins",
+        )
+        return
+    attrs = {
+        "latitude": lat,
+        "longitude": lon,
+        "source_type": "gps",
+        "source": "google_timeline",
+        "google_timeline_type": "parking",
+        "google_timeline": {"parking": parking},
+    }
+    conn.execute(
+        "INSERT INTO google_parking VALUES (?, ?, ?, ?, ?)",
+        (ts, lat, lon, _google_json(attrs), _google_json(source)),
+    )
+
+
 def _stage_google_segment(
     conn: sqlite3.Connection,
     segment,
@@ -1291,6 +1374,7 @@ def _import_google_file(
     time_zone: str,
     cancelled: threading.Event,
     audit: _GoogleImportLog | None = None,
+    car_target: dict | None = None,
 ) -> dict:
     """Own the diagnostic log through success, failure and cancellation."""
     audit = audit or _GoogleImportLog(
@@ -1302,9 +1386,24 @@ def _import_google_file(
     )
     audit.cancelled = cancelled
     try:
-        audit.write({"event": "mapping", "history_targets": targets, "time_zone": time_zone})
+        audit.write(
+            {
+                "event": "mapping",
+                "history_targets": targets,
+                "car_target": car_target,
+                "time_zone": time_zone,
+            }
+        )
         _import_google_archive(
-            db_path, file_name, entry_id, entity_id, targets, time_zone, cancelled, audit
+            db_path,
+            file_name,
+            entry_id,
+            entity_id,
+            targets,
+            time_zone,
+            cancelled,
+            audit,
+            car_target,
         )
     except Exception as err:
         audit.finish(str(err))
@@ -1322,8 +1421,11 @@ def _import_google_archive(
     time_zone: str,
     cancelled: threading.Event,
     audit: _GoogleImportLog,
+    car_target: dict | None = None,
 ) -> None:
     """Read the complete source, then insert valid records in one upstream transaction."""
+    if car_target and car_target["entity_id"] in (entity_id, *targets.values()):
+        raise ValueError("The car tracker must differ from all person targets")
     if (
         not file_name
         or Path(file_name).name != file_name
@@ -1347,6 +1449,10 @@ def _import_google_archive(
             "raw_signals_read": 0,
             "raw_positions_read": 0,
             "raw_activity_records_read": 0,
+            "car_entity_id": car_target["entity_id"] if car_target else None,
+            "parking_records_read": 0,
+            "parking_points_inserted": 0,
+            "parking_days": 0,
         }
     )
     with contextlib.closing(
@@ -1368,6 +1474,8 @@ def _import_google_archive(
             " attributes TEXT, kind TEXT, source TEXT, PRIMARY KEY(entity_id, ts));"
             "CREATE TEMP TABLE google_raw_activities (ts REAL PRIMARY KEY, state TEXT,"
             " attributes TEXT, source TEXT, confidence REAL);"
+            "CREATE TEMP TABLE google_parking (ts REAL PRIMARY KEY, lat REAL, lon REAL,"
+            " attributes TEXT, source TEXT);"
         )
         try:
             with source.open(encoding="utf-8-sig") as stream:
@@ -1384,6 +1492,7 @@ def _import_google_archive(
                         if cancelled.is_set():
                             audit.item("not_imported", "cancelled_segment", path, segment)
                             raise ValueError("Import cancelled")
+                        _stage_google_parking(conn, segment, audit, path, car_target)
                         counts = _stage_google_segment(conn, segment, targets, audit, path)
                         result["segments_read"] += 1
                         for key, count in counts.items():
@@ -1410,6 +1519,7 @@ def _import_google_archive(
             conn.set_progress_handler(lambda: int(cancelled.is_set()), 1000)
             zone = ZoneInfo(time_zone)
             days: set[str] = set()
+            parking_days: set[str] = set()
             with conn:
                 conn.execute("BEGIN IMMEDIATE")
                 row = conn.execute(
@@ -1421,6 +1531,18 @@ def _import_google_archive(
                         "The configured tracker is no longer present in the archive"
                     )
                 tracker_id = row[0]
+                car_tracker_id = None
+                if car_target:
+                    car_row = conn.execute(
+                        "SELECT id FROM trackers WHERE entry_id=? AND entity_id=?",
+                        (car_target["entry_id"], car_target["entity_id"]),
+                    ).fetchone()
+                    if car_row is None or car_row[0] == tracker_id:
+                        raise ValueError(
+                            "The configured car tracker is no longer separately bound"
+                            " in the archive"
+                        )
+                    car_tracker_id = car_row[0]
                 for target in targets.values():
                     if (
                         target
@@ -1489,6 +1611,33 @@ def _import_google_archive(
                         " FROM google_states WHERE kind=?",
                         (tracker_id, kind),
                     ).rowcount
+                if car_tracker_id is not None:
+                    for raw, ts, old_lat, old_lon in conn.execute(
+                        "SELECT g.source, g.ts, p.lat, p.lon FROM google_parking AS g"
+                        " JOIN points AS p ON p.ts=g.ts AND p.tracker_id=?",
+                        (car_tracker_id,),
+                    ):
+                        audit.item(
+                            "existing",
+                            "existing_parking_point",
+                            **json.loads(raw),
+                            timestamp=ts,
+                            reason="Existing car archive point is preserved",
+                            existing_coordinates={"latitude": old_lat, "longitude": old_lon},
+                        )
+                    for (ts,) in conn.execute(
+                        "SELECT ts FROM google_parking AS g WHERE NOT EXISTS"
+                        " (SELECT 1 FROM points AS p WHERE p.tracker_id=? AND p.ts=g.ts)",
+                        (car_tracker_id,),
+                    ):
+                        parking_days.add(datetime.fromtimestamp(ts, zone).date().isoformat())
+                    result["parking_points_inserted"] = conn.execute(
+                        "INSERT OR IGNORE INTO points"
+                        " (tracker_id, ts, state, lat, lon, source_type, attributes)"
+                        " SELECT ?, ts, 'not_home', lat, lon, 'gps', attributes"
+                        " FROM google_parking",
+                        (car_tracker_id,),
+                    ).rowcount
                 # All detail records must be writable before we commit the archive.
                 audit.stream.flush()
                 if cancelled.is_set():
@@ -1496,8 +1645,19 @@ def _import_google_archive(
             audit.committed = True
             result["days"] = len(days)
             result["points_skipped"] = result["points_read"] - result["points_inserted"]
+            result["parking_days"] = len(parking_days)
+            result["parking_points_skipped"] = (
+                result["parking_records_read"] - result["parking_points_inserted"]
+            )
             result["message"] = (
-                f"Imported records on {len(days)} days; diagnostic log: {audit.path.name}"
+                f"Imported records for {entity_id} on {len(days)} days; "
+                + (
+                    f"{result['parking_points_inserted']} parking points for"
+                    f" {car_target['entity_id']} on {len(parking_days)} days; "
+                    if car_target
+                    else ""
+                )
+                + f"diagnostic log: {audit.path.name}"
             )
         except Exception:
             # After rollback, every previously accepted source item still needs an
@@ -1507,6 +1667,7 @@ def _import_google_archive(
                 "SELECT source FROM google_points"
                 " UNION ALL SELECT source FROM google_intervals"
                 " UNION ALL SELECT source FROM google_raw_activities"
+                " UNION ALL SELECT source FROM google_parking"
             ):
                 audit.item(
                     "not_imported",
