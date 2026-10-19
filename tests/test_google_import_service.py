@@ -3,6 +3,7 @@
 import asyncio
 from copy import deepcopy
 from datetime import datetime
+import gzip
 from io import StringIO
 import json
 from pathlib import Path
@@ -122,6 +123,24 @@ def archive_snapshot(path):
         }
 
 
+def read_log(path):
+    with gzip.open(path, "rt", encoding="utf-8") as stream:
+        records = [json.loads(line) for line in stream]
+    assert records[0]["event"] == "header"
+    assert records[-1]["event"] == "summary"
+    return records
+
+
+def log_items(records, code):
+    return [record for record in records if record.get("code") == code]
+
+
+def only_log(db_path):
+    logs = list(db_path.parent.glob("google_timeline_import_*.jsonl.gz"))
+    assert len(logs) == 1
+    return logs[0]
+
+
 async def test_import_preserves_upstream_schema_entities_existing_rows_and_is_idempotent(hass):
     entry, path = await setup_import(hass)
     store = hass.data[DOMAIN]["store"]
@@ -222,14 +241,10 @@ async def test_path_only_export_needs_no_companions(hass):
     assert result["visit_states_inserted"] == result["activity_states_inserted"] == 0
 
 
-@pytest.mark.parametrize("damage", ["truncated", "trailing", "coordinates", "time", "nan"])
+@pytest.mark.parametrize("damage", ["truncated", "trailing", "nan"])
 async def test_invalid_file_does_not_partially_import(hass, damage):
     _, path = await setup_import(hass)
     payload = deepcopy(export())
-    if damage == "coordinates":
-        payload["semanticSegments"][-1]["timelinePath"][-1]["point"] = "91°, 8°"
-    if damage == "time":
-        payload["semanticSegments"][-1]["timelinePath"][-1]["time"] = "2020-01-02T11:00:00"
     text = json.dumps(payload)
     if damage == "truncated":
         text = text[:-1]
@@ -330,6 +345,10 @@ async def test_sql_failure_rolls_back_all_new_archive_rows(hass, monkeypatch):
     with pytest.raises(HomeAssistantError, match="simulated storage error"):
         await call_import(hass)
     assert archive_snapshot(path) == before
+    records = read_log(only_log(path))
+    assert records[-1]["committed"] is False
+    assert records[-1]["result"]["points_inserted"] == 0
+    assert len(log_items(records, "import_aborted")) == 8
 
 
 async def test_live_writes_continue_during_staging_and_take_precedence(hass, monkeypatch):
@@ -380,4 +399,291 @@ async def test_cancellation_waits_for_worker_and_leaves_archive_unchanged(hass, 
     resume.set()
     with pytest.raises(asyncio.CancelledError):
         await task
+    assert archive_snapshot(path) == before
+    records = read_log(only_log(path))
+    assert records[-1]["status"] == "cancelled"
+    assert records[-1]["committed"] is False
+    assert log_items(records, "import_aborted")
+    assert log_items(records, "unparsed_json_text")
+
+
+async def test_every_call_has_a_private_complete_log_including_existing_rows(hass):
+    _, path = await setup_import(hass)
+    first = await call_import(hass)
+    second = await call_import(hass)
+    assert first["log_file"] != second["log_file"]
+    assert len(list(path.parent.glob("google_timeline_import_*.jsonl.gz"))) == 2
+    for result in (first, second):
+        logfile = Path(result["log_file"])
+        assert logfile.parent == path.parent
+        assert logfile.stat().st_mode & 0o777 == 0o600
+        summary = read_log(logfile)[-1]
+        assert summary["status"] == "completed"
+        assert summary["committed"] is summary["parse_complete"] is True
+        assert summary["result"] == result
+    records = read_log(second["log_file"])
+    assert len(log_items(records, "existing_point")) == 5
+    states = log_items(records, "existing_companion_state")
+    assert len(states) == 5
+    assert states[0]["source_items"]
+    visit_sources = [
+        source
+        for record in states
+        for source in record["source_items"]
+        if source["path"] == "$.semanticSegments[0].visit"
+    ]
+    assert visit_sources[0]["data"] == visit()["visit"]
+
+
+async def test_whole_json_is_inventoried_and_unknown_values_are_not_truncated(hass):
+    payload = {
+        "before": [{"nested": [1, None, True, {"name": "ü" * 70000}]}],
+        **export(),
+        "rawSignals": [{"sample": index} for index in range(1200)],
+        "userLocationProfile": {"places": [{"other": "not supported"}]},
+        'odd.key["x"]': {"extra": False},
+        "empty": [],
+        "last": None,
+    }
+    await setup_import(hass, payload)
+    result = await call_import(hass)
+    records = read_log(result["log_file"])
+    items = [record for record in records if record["event"] == "item"]
+    by_path = {record["json_path"]: record for record in items}
+    assert by_path["$.before[0]"]["data"] == payload["before"][0]
+    for index, value in enumerate(payload["rawSignals"]):
+        assert by_path[f"$.rawSignals[{index}]"]["data"] == value
+    for key in ("userLocationProfile", 'odd.key["x"]', "empty", "last"):
+        json_path = services._google_json_path("$", key)
+        assert by_path[json_path]["data"] == payload[key]
+    inventory = records[-1]["field_inventory"]
+    assert inventory["$.before[*].nested[*].name"] == {"str": 1}
+    assert inventory["$.rawSignals[*].sample"] == {"int": 1200}
+    assert inventory["$.userLocationProfile.places[*].other"] == {"str": 1}
+    assert inventory["$.semanticSegments[*].activity.topCandidate.probability"] == {"float": 2}
+    assert result["unsupported_items"] == 1205
+    assert result["points_inserted"] == 5
+
+
+async def test_unused_segment_point_and_coordinate_fields_have_exact_values(hass):
+    segment = {
+        "startTime": timestamp(10),
+        "endTime": timestamp(12),
+        "newSegmentKind": {"future": [1, {"other": "value"}]},
+        "timelinePath": [
+            {
+                "point": {"latLng": "50°, 8°", "accuracy": {"meters": 42}},
+                "time": timestamp(10),
+                "durationMinutesOffsetFromStartTime": 7,
+                "extra": ["all", "values"],
+            }
+        ],
+    }
+    await setup_import(hass, {"semanticSegments": [segment]})
+    result = await call_import(hass)
+    records = read_log(result["log_file"])
+    by_path = {record["json_path"]: record for record in records if record["event"] == "item"}
+    prefix = "$.semanticSegments[0]"
+    assert by_path[f"{prefix}.newSegmentKind"]["data"] == segment["newSegmentKind"]
+    assert by_path[f"{prefix}.timelinePath[0].extra"]["data"] == ["all", "values"]
+    assert by_path[f"{prefix}.timelinePath[0].point.accuracy"]["data"] == {"meters": 42}
+    assert by_path[f"{prefix}.timelinePath[0].durationMinutesOffsetFromStartTime"]["data"] == 7
+    assert by_path[prefix]["code"] == "segment_metadata_not_archived"
+    assert result["points_inserted"] == 1
+
+
+@pytest.mark.parametrize("damage", ["coordinates", "time", "missing", "not_object"])
+async def test_bad_point_is_logged_without_losing_valid_neighbors(hass, damage):
+    bad = {"point": "50°, 8°", "time": timestamp(11)}
+    if damage == "coordinates":
+        bad["point"] = "91°, 8°"
+    elif damage == "time":
+        bad["time"] = "2020-01-02T11:00:00"
+    elif damage == "missing":
+        del bad["point"]
+    else:
+        bad = ["unexpected", "array"]
+    segment = {
+        "timelinePath": [
+            {"point": "50°, 8°", "time": timestamp(10)},
+            bad,
+            {"point": "51°, 9°", "time": timestamp(12)},
+        ]
+    }
+    await setup_import(hass, {"semanticSegments": [segment]})
+    result = await call_import(hass)
+    records = read_log(result["log_file"])
+    invalid = log_items(records, "invalid_point")
+    assert len(invalid) == result["invalid_items"] == 1
+    assert invalid[0]["data"] == bad
+    assert invalid[0]["json_path"] == "$.semanticSegments[0].timelinePath[1]"
+    assert invalid[0]["reason"]
+    assert result["points_inserted"] == 2
+    assert records[-1]["parse_complete"] is True
+
+
+async def test_invalid_semantic_items_do_not_leak_points_or_hide_valid_siblings(hass):
+    segment = visit()
+    segment["activity"] = activity(timestamp(10), timestamp(11))["activity"]
+    segment["activity"]["end"] = {"latLng": "200°, 9°"}
+    invalid_visit = visit(12, 13, hierarchyLevel="invalid")
+    payload = {
+        "semanticSegments": [
+            segment,
+            invalid_visit,
+            42,
+            {"timelinePath": "not an array"},
+            {"timelinePath": []},
+            {"unknownSegment": {"all": "preserved"}},
+            activity(timestamp(14), timestamp(15)),
+        ],
+        "last": {"also": "seen"},
+    }
+    _, path = await setup_import(hass, payload)
+    result = await call_import(hass)
+    records = read_log(result["log_file"])
+    assert log_items(records, "invalid_activity")[0]["data"] == segment["activity"]
+    assert log_items(records, "invalid_visit")[0]["data"] == invalid_visit["visit"]
+    assert log_items(records, "invalid_segment")[0]["data"] == 42
+    assert log_items(records, "invalid_timeline_path")[0]["data"] == "not an array"
+    assert log_items(records, "empty_timeline_path")
+    assert log_items(records, "unsupported_segment")
+    assert result["invalid_items"] == 4
+    assert result["points_inserted"] == 4
+    # The valid start of the rejected activity must not displace the visit location.
+    assert archive_snapshot(path)["points"][0][4:6] == (51, 9)
+    assert result["visits_read"] == result["activities_read"] == 1
+
+
+async def test_missing_history_target_still_scans_every_section_and_logs_rollback(hass):
+    _, path = await setup_import(hass, companions=False)
+    before = archive_snapshot(path)
+    with pytest.raises(HomeAssistantError, match="Diagnostic log:"):
+        await call_import(hass)
+    records = read_log(only_log(path))
+    assert len(log_items(records, "missing_history_target")) == 3
+    assert (
+        log_items(records, "unsupported_top_level_item")[0]["data"]
+        == export()["rawSignals"][0]
+    )
+    assert len(log_items(records, "import_aborted")) == 3
+    assert records[-1]["parse_complete"] is True
+    assert records[-1]["committed"] is False
+    assert archive_snapshot(path) == before
+
+
+async def test_duplicate_points_intervals_and_zero_duration_include_original_values(hass):
+    segment = export()["semanticSegments"][-1]
+    duplicate = deepcopy(segment["timelinePath"][0])
+    segment["timelinePath"].append(duplicate)
+    await setup_import(hass, {"semanticSegments": [visit(), visit(), segment, visit(15, 15)]})
+    result = await call_import(hass)
+    records = read_log(result["log_file"])
+    assert log_items(records, "duplicate_interval")[0]["data"] == visit()["visit"]
+    assert any(item["data"] == duplicate for item in log_items(records, "duplicate_point"))
+    collisions = log_items(records, "point_timestamp_collision")
+    assert any(item["json_path"].endswith(".placeLocation") for item in collisions)
+    assert any(item["data"] == segment["timelinePath"][2] for item in collisions)
+    assert all(item["kept_json_path"] for item in collisions)
+    assert log_items(records, "zero_duration_interval")[0]["data"] == visit(15, 15)["visit"]
+    assert result["points_inserted"] == 4
+
+
+async def test_shadowed_duplicate_json_members_are_preserved_in_log(hass):
+    _, path = await setup_import(hass)
+    text = json.dumps({"semanticSegments": [visit()]})
+    text = text.replace(
+        '"hierarchyLevel": 0', '"hierarchyLevel": {"old": 7}, "hierarchyLevel": 0'
+    )
+    path.with_name("Timeline.json").write_text(text)
+    result = await call_import(hass)
+    records = read_log(result["log_file"])
+    duplicate = log_items(records, "duplicate_json_key")
+    assert len(duplicate) == 1
+    assert duplicate[0]["json_path"] == "$.semanticSegments[0].visit.hierarchyLevel"
+    assert duplicate[0]["data"] == {"old": 7}
+    assert records[-1]["field_inventory"][
+        "$.semanticSegments[*].visit.hierarchyLevel.old"
+    ] == {"int": 1}
+    assert result["visit_states_inserted"] == 2
+
+
+async def test_syntax_failure_preserves_complete_unparsed_tail_and_accepted_sources(hass):
+    _, path = await setup_import(hass)
+    unread = '{"broken": ' + '"unfinished ' * 12000
+    text = '{"semanticSegments":[' + json.dumps(visit()) + "," + unread
+    path.with_name("Timeline.json").write_text(text)
+    before = archive_snapshot(path)
+    with pytest.raises(HomeAssistantError, match="Diagnostic log:"):
+        await call_import(hass)
+    records = read_log(only_log(path))
+    chunks = log_items(records, "unparsed_json_text")
+    assert "".join(item["data"] for item in chunks) == unread
+    offset = text.index(unread)
+    for chunk in chunks:
+        assert chunk["character_offset"] == offset
+        offset += len(chunk["data"])
+    assert log_items(records, "json_read_failed")[0]["json_path"] == "$.semanticSegments[1]"
+    assert len(log_items(records, "import_aborted")) == 3
+    assert records[-1]["parse_complete"] is records[-1]["committed"] is False
+    assert records[-1]["result"]["points_inserted"] == 0
+    assert archive_snapshot(path) == before
+
+
+@pytest.mark.parametrize(
+    "overrides", [{"entity_id": "device_tracker.missing"}, {"file_name": "missing.json"}]
+)
+async def test_preflight_errors_also_create_closed_diagnostic_logs(hass, overrides):
+    _, path = await setup_import(hass)
+    with pytest.raises(HomeAssistantError, match="Diagnostic log:") as err:
+        await call_import(hass, **overrides)
+    logfile = only_log(path)
+    assert str(logfile) in str(err.value)
+    records = read_log(logfile)
+    assert records[-1]["status"] == "failed"
+    assert records[-1]["error"]
+    assert records[-1]["committed"] is records[-1]["parse_complete"] is False
+
+
+async def test_entirely_unknown_export_is_still_fully_logged(hass):
+    payload = {"otherExport": [{"unknown": 1}, {"last": 2}], "metadata": {"version": 99}}
+    _, path = await setup_import(hass, payload)
+    before = archive_snapshot(path)
+    with pytest.raises(HomeAssistantError, match="semanticSegments"):
+        await call_import(hass)
+    records = read_log(only_log(path))
+    assert [r["data"] for r in log_items(records, "unsupported_top_level_item")] == payload[
+        "otherExport"
+    ]
+    assert log_items(records, "unsupported_top_level_field")[0]["data"] == payload["metadata"]
+    assert records[-1]["parse_complete"] is True
+    assert records[-1]["committed"] is False
+    assert archive_snapshot(path) == before
+
+
+async def test_cancellation_while_creating_log_closes_it_without_starting_import(
+    hass, monkeypatch
+):
+    _, path = await setup_import(hass)
+    before = archive_snapshot(path)
+    entered, resume = threading.Event(), threading.Event()
+    create = services._GoogleImportLog
+
+    def pause(*args):
+        audit = create(*args)
+        entered.set()
+        assert resume.wait(10)
+        return audit
+
+    monkeypatch.setattr(services, "_GoogleImportLog", pause)
+    task = asyncio.create_task(call_import(hass))
+    assert await hass.async_add_executor_job(entered.wait, 10)
+    task.cancel()
+    await asyncio.sleep(0)
+    resume.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    records = read_log(only_log(path))
+    assert records[-1]["status"] == "cancelled"
+    assert records[-1]["committed"] is False
     assert archive_snapshot(path) == before
